@@ -5,6 +5,8 @@ use err_derive::Error;
 use log::*;
 use nom::IResult;
 use nom::{bytes::streaming::take, combinator::*, number::streaming::*, sequence::*};
+use std::collections::hash_map::Entry;
+use std::convert::TryInto;
 use std::io::Read;
 
 #[derive(Debug, Error)]
@@ -116,7 +118,7 @@ fn bc_modern_msg<'a, 'b, 'c>(
         Err,
     };
 
-    let mut in_bin_mode = context.last_binary_kind.contains_key(&header.msg_id);
+    let mut in_bin_mode = context.binary_mode.contains_key(&header.msg_id);
 
     // We'd like to know where the XML stops, but we haven't parsed the XML yet to see if the
     // binaryData offset in the header is valid
@@ -165,74 +167,67 @@ fn bc_modern_msg<'a, 'b, 'c>(
     if in_bin_mode {
         if let Some(bin_offset) = header.bin_offset {
             // Extract remainder of message as binary, if it exists
-            let (buf_after, payload) =
-                map(take(header.body_len - bin_offset), |x: &[u8]| x.to_vec())(buf)?;
+            let (buf_after, data) = take(header.body_len - bin_offset)(buf)?;
 
             // Since the parser operates in streaming mode, must wait until after we successfully
             // receive enough bytes before modifying the context (otherwise we'll alter the
             // behavior of future passes of this function even if we didn't yet consume the
-            // message).
-
-            let mut binary_data = BinaryData {
-                data: payload,
-                continuation_of: None,
-            };
-            let binary_kind = binary_data.kind();
-            let body_size = binary_data.body_size();
-            let data_size = binary_data.data_size();
-
-            let remaining_binary_bytes = match context.remaining_binary_bytes.get(&header.msg_id) {
-                Some(remaining_binary_bytes) => remaining_binary_bytes.clone(),
-                None => 0,
-            };
-            let last_binary_kind = match context.last_binary_kind.get(&header.msg_id) {
-                Some(last_binary_kind) => last_binary_kind.clone(),
-                None => None,
+            // message).  At this point we are done calling combinators, so it is now safe to
+            // modify the context.
+            let media_state: &mut MediaPacketState = match context.binary_mode.entry(header.msg_id) {
+                Entry::Occupied(occ_entry) => occ_entry.into_mut(),
+                Entry::Vacant(vac_entry) => vac_entry.insert(MediaPacketState {
+                    current_kind: BinaryDataKind::Unknown,
+                    remaining_kind_bytes: 0,
+                })
             };
 
-            // Handle continuation
-            if binary_kind != BinaryDataKind::Unknown && data_size > body_size {
-                // If it is a known type and the size is larger than the bodysize expect more
-                // packets to follow
-                context
-                    .remaining_binary_bytes
-                    .insert(header.msg_id, data_size - body_size);
-                context
-                    .last_binary_kind
-                    .insert(header.msg_id, Some(binary_kind));
-            } else if binary_kind == BinaryDataKind::Unknown
-                && remaining_binary_bytes > 0
-                && remaining_binary_bytes >= body_size
-            {
-                // If the data is unknown and we are expecting packets then proccess them
-                // Ensure however that consuming this packet as binary will not result in
-                // negative remaining_binary_bytes
-                if body_size == CHUNK_SIZE {
-                    // All known continuation packets are of size CHUNK_SIZE
-                    binary_data.continuation_of = last_binary_kind;
-                    context
-                        .remaining_binary_bytes
-                        .insert(header.msg_id, remaining_binary_bytes - body_size);
-                } else {
-                    // If its not of chunk size this may be an unknown magic code
-                    // Reset but suggest that this might be an unknown magic code
-                    trace!(
-                        "Possibly new magic code: {:x?}",
-                        &binary_data.body()[..std::cmp::min(body_size, 32)]
-                    );
-                    context.remaining_binary_bytes.insert(header.msg_id, 0);
-                    context.last_binary_kind.insert(header.msg_id, None);
-                }
+            // Parse the "media packet" in the binary data, which has another header before the
+            // actual video data.  Some media packets must be segmented across multiple 40KB
+            // Baichuan packets.  The media packet header contains the total length.
+            let detected_kind = media_packet_magic_kind(&data);
+            let detected_len = media_packet_len(detected_kind, &data);
+            trace!("Detected {} byte packet, kind {:?}", detected_len, detected_kind);
+
+            // Sometimes media packets are interrupted/truncated by the start of another media
+            // packet, so check for the header magic at the top of every Baichuan binary data
+            // payload, even if we're expecting more data from a previous kind.
+            let inferred_kind;
+            if detected_kind != BinaryDataKind::Unknown {
+                // Found a new header
+                inferred_kind = detected_kind;
+
+                media_state.current_kind = detected_kind;
+                media_state.remaining_kind_bytes = detected_len;
             } else {
-                // In all other cases just proccess data as normal non-continuation packets
-                // We also reset the remaining_binary_bytes which could be non zero if
-                // The continuation was inturrepted by an audio frame
-                // Reset
-                context.remaining_binary_bytes.insert(header.msg_id, 0);
-                context.last_binary_kind.insert(header.msg_id, None);
+                // Either a continuation, or we have never seen a header
+                inferred_kind = media_state.current_kind;
+            };
+            trace!("Inferred kind {:?}", inferred_kind);
+
+            let lower_limit = media_header_size(detected_kind) as usize;
+            let media_payload_len = std::cmp::min(data.len() - lower_limit, media_state.remaining_kind_bytes as usize);
+            let upper_limit = lower_limit + media_payload_len;
+            let v = Vec::from(&data[lower_limit..upper_limit]);
+
+            if v.len() < media_state.remaining_kind_bytes as usize {
+                // Still have more bytes to receive.  Sometimes Reolink sends up to 8 extra bytes
+                // past the media packet's claimed length, possibly due to buggy accounting.  All
+                // media packets seem to start in their own Baichuan packet, so we will disregard
+                // these extra bytes when the next header is detected, and they are sliced away
+                // when the last media packet continuation is handled.
+                media_state.remaining_kind_bytes -= v.len() as u32;
+            } else {
+                // Current packet is finished
+                media_state.current_kind = BinaryDataKind::Unknown;
+                media_state.remaining_kind_bytes = 0;
             }
 
-            binary = Some(binary_data);
+            if inferred_kind == BinaryDataKind::Unknown {
+                debug!("Unknown media packet magic value: {:?}", &v[0..4]);
+            }
+
+            binary = Some(BinaryData { buf: v, kind: inferred_kind });
             buf = buf_after;
         } else {
             // Seriously, Nom, what even is this
@@ -269,6 +264,69 @@ fn bc_header(buf: &[u8]) -> IResult<&[u8], BcHeader> {
             bin_offset,
         },
     ))
+}
+
+pub fn media_packet_magic_kind(data: &[u8]) -> BinaryDataKind {
+    const MAGIC_VIDEO_INFO: &[u8] = &[0x31, 0x30, 0x30, 0x31];
+    const MAGIC_AAC: &[u8] = &[0x30, 0x35, 0x77, 0x62];
+    const MAGIC_ADPCM: &[u8] = &[0x30, 0x31, 0x77, 0x62];
+    const MAGIC_IFRAME: &[u8] = &[0x30, 0x30, 0x64, 0x63];
+    const MAGIC_PFRAME: &[u8] = &[0x30, 0x31, 0x64, 0x63];
+
+    let magic = &data[..4];
+    trace!("Magic is: {:x?}", &magic);
+    match magic {
+        MAGIC_VIDEO_INFO => {
+            trace!("Video info magic type");
+            BinaryDataKind::Info
+        }
+        MAGIC_AAC => {
+            trace!("AAC magic type");
+            BinaryDataKind::AudioAac
+        }
+        MAGIC_ADPCM => {
+            trace!("ADPCM magic type");
+            BinaryDataKind::AudioAdpcm
+        }
+        MAGIC_IFRAME => {
+            trace!("IFrame magic type");
+            BinaryDataKind::VideoIframe
+        }
+        MAGIC_PFRAME => {
+            trace!("PFrame magic type");
+            BinaryDataKind::VideoPframe
+        }
+        _ => {
+            // When large data is chunked it goes here
+            // We work out whether or not it is a continued chunked in the deserialization
+            trace!("Unknown magic type");
+            BinaryDataKind::Unknown
+        }
+    }
+}
+
+fn media_packet_len(kind: BinaryDataKind, data: &[u8]) -> u32 {
+    use BinaryDataKind::*;
+    match kind {
+        VideoIframe => u32::from_le_bytes(data[8..12].try_into().unwrap()),
+        VideoPframe => u32::from_le_bytes(data[8..12].try_into().unwrap()),
+        AudioAac => u16::from_le_bytes(data[4..6].try_into().unwrap()) as u32,
+        AudioAdpcm => u16::from_le_bytes(data[4..6].try_into().unwrap()) as u32,
+        Info => u32::from_le_bytes(data[4..8].try_into().unwrap()),
+        Unknown => data.len() as u32,
+    }
+}
+
+fn media_header_size(kind: BinaryDataKind) -> u32 {
+    use BinaryDataKind::*;
+    match kind {
+        VideoIframe => 32,
+        VideoPframe => 24,
+        AudioAac => 8,
+        AudioAdpcm => 16,
+        Info => 32,
+        Unknown => 0,
+    }
 }
 
 #[test]

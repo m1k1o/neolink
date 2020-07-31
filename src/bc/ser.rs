@@ -51,7 +51,7 @@ impl Bc {
             ..
         }) = self.body
         {
-            let (buf2, _) = gen(slice(binary), buf)?;
+            let (buf2, _) = gen(slice(&binary.buf), buf)?;
             buf = buf2
         }
 

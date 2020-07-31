@@ -1,15 +1,11 @@
 use super::xml::BcXml;
-use log::trace;
 use std::collections::HashMap;
-use std::convert::TryInto;
 
 pub(super) const MAGIC_HEADER: u32 = 0xabcdef0;
 
 pub const MSG_ID_LOGIN: u32 = 1;
 pub const MSG_ID_VIDEO: u32 = 3;
 pub const MSG_ID_PING: u32 = 93;
-
-pub const CHUNK_SIZE: usize = 40000;
 
 pub const EMPTY_LEGACY_PASSWORD: &str =
     "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
@@ -24,152 +20,6 @@ pub struct Bc {
 pub enum BcBody {
     LegacyMsg(LegacyMsg),
     ModernMsg(ModernMsg),
-}
-
-#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
-pub enum BinaryDataKind {
-    VideoDataIframe,
-    VideoDataPframe,
-    VideoCont,
-    AudioDataAac,
-    AudioDataAdpcm,
-    AudioCont,
-    InfoData,
-    InfoDataCont,
-    Unknown,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct BinaryData {
-    pub data: Vec<u8>,
-    pub continuation_of: Option<BinaryDataKind>,
-}
-
-impl BinaryData {
-    pub fn body(&self) -> &[u8] {
-        let lower_limit = self.header_size();
-        let upper_limit = self.body_size() + lower_limit;
-        &self.data[lower_limit..upper_limit]
-    }
-
-    pub fn header_size(&self) -> usize {
-        match self.kind() {
-            BinaryDataKind::VideoDataIframe => 32,
-            BinaryDataKind::VideoDataPframe => 24,
-            BinaryDataKind::AudioDataAac => 8,
-            BinaryDataKind::AudioDataAdpcm => 16,
-            BinaryDataKind::InfoData => 32,
-            BinaryDataKind::Unknown
-            | BinaryDataKind::VideoCont
-            | BinaryDataKind::AudioCont
-            | BinaryDataKind::InfoDataCont => 0,
-        }
-    }
-
-    pub fn data_size(&self) -> usize {
-        match self.kind() {
-            BinaryDataKind::VideoDataIframe => BinaryData::bytes_to_size(&self.data[8..12]),
-            BinaryDataKind::VideoDataPframe => BinaryData::bytes_to_size(&self.data[8..12]),
-            BinaryDataKind::AudioDataAac => BinaryData::bytes_to_size(&self.data[4..6]),
-            BinaryDataKind::AudioDataAdpcm => BinaryData::bytes_to_size(&self.data[4..6]),
-            BinaryDataKind::InfoData => BinaryData::bytes_to_size(&self.data[4..8]),
-            BinaryDataKind::Unknown
-            | BinaryDataKind::VideoCont
-            | BinaryDataKind::AudioCont
-            | BinaryDataKind::InfoDataCont => self.data.len(),
-        }
-    }
-
-    pub fn body_size(&self) -> usize {
-        match self.data_size() % CHUNK_SIZE {
-            0 => CHUNK_SIZE, // Modulo quirk that 39999 -> 39999, 40000 -> 0, 40001 -> 1
-            n => n,
-        }
-    }
-
-    fn bytes_to_size(bytes: &[u8]) -> usize {
-        match bytes.len() {
-            // 8 Won't fit into usize on a 32-bit machine
-            4 => u32::from_le_bytes(bytes.try_into().expect("slice with incorrect length"))
-                .try_into()
-                .expect("u32 won't fit into usize"),
-            2 => u16::from_le_bytes(bytes.try_into().expect("slice with incorrect length"))
-                .try_into()
-                .expect("u16 won't fit into usize"),
-            1 => u8::from_le_bytes(bytes.try_into().expect("slice with incorrect length"))
-                .try_into()
-                .expect("u8 won't fit into usize"),
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn kind(&self) -> BinaryDataKind {
-        const MAGIC_VIDEO_INFO: &[u8] = &[0x31, 0x30, 0x30, 0x31];
-        const MAGIC_AAC: &[u8] = &[0x30, 0x35, 0x77, 0x62];
-        const MAGIC_ADPCM: &[u8] = &[0x30, 0x31, 0x77, 0x62];
-        const MAGIC_IFRAME: &[u8] = &[0x30, 0x30, 0x64, 0x63];
-        const MAGIC_PFRAME: &[u8] = &[0x30, 0x31, 0x64, 0x63];
-
-        if let Some(continuation_of) = &self.continuation_of {
-            return match continuation_of {
-                BinaryDataKind::VideoDataIframe
-                | BinaryDataKind::VideoDataPframe
-                | BinaryDataKind::VideoCont => BinaryDataKind::VideoCont,
-                BinaryDataKind::AudioDataAac
-                | BinaryDataKind::AudioDataAdpcm
-                | BinaryDataKind::AudioCont => BinaryDataKind::AudioCont,
-                BinaryDataKind::InfoData | BinaryDataKind::InfoDataCont => {
-                    BinaryDataKind::InfoDataCont
-                }
-                BinaryDataKind::Unknown => BinaryDataKind::Unknown,
-            };
-        }
-
-        let magic = &self.data[..4];
-        trace!("Magic is: {:x?}", &magic);
-        match magic {
-            MAGIC_VIDEO_INFO => {
-                trace!("Video info magic type");
-                BinaryDataKind::InfoData
-            }
-            MAGIC_AAC => {
-                trace!("AAC magic type");
-                BinaryDataKind::AudioDataAac
-            }
-            MAGIC_ADPCM => {
-                trace!("ADPCM magic type");
-                BinaryDataKind::AudioDataAdpcm
-            }
-            MAGIC_IFRAME => {
-                trace!("IFrame magic type");
-                BinaryDataKind::VideoDataIframe
-            }
-            MAGIC_PFRAME => {
-                trace!("PFrame magic type");
-                BinaryDataKind::VideoDataPframe
-            }
-            _ => {
-                // When large data is chunked it goes here
-                // We work out whether or not it is a continued chunked in the deserialization
-                trace!("Unknown magic type");
-                BinaryDataKind::Unknown
-            }
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        self.data.as_slice()
-    }
-}
-
-impl std::convert::AsRef<[u8]> for BinaryData {
-    fn as_ref(&self) -> &[u8] {
-        self.as_slice()
-    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -213,9 +63,31 @@ pub(super) struct BcSendInfo {
 }
 
 #[derive(Debug)]
+pub(super) struct MediaPacketState {
+    pub current_kind: BinaryDataKind,
+    // media packet header's length field is 32 bit:
+    pub remaining_kind_bytes: u32,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
+pub enum BinaryDataKind {
+    VideoIframe,
+    VideoPframe,
+    AudioAac,
+    AudioAdpcm,
+    Info,
+    Unknown,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct BinaryData {
+    pub kind: BinaryDataKind,
+    pub buf: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
 pub struct BcContext {
-    pub(super) last_binary_kind: HashMap<u32, Option<BinaryDataKind>>,
-    pub(super) remaining_binary_bytes: HashMap<u32, usize>,
+    pub(super) binary_mode: HashMap<u32, MediaPacketState>,
 }
 
 impl Bc {
@@ -234,10 +106,7 @@ impl Bc {
 
 impl BcContext {
     pub fn new() -> BcContext {
-        BcContext {
-            last_binary_kind: HashMap::new(),
-            remaining_binary_bytes: HashMap::new(),
-        }
+        BcContext::default()
     }
 }
 

@@ -277,23 +277,21 @@ impl BcCamera {
                 ..
             }) = msg.body
             {
-                trace!("Got {} bytes of video data", binary.len());
-                match binary.kind() {
-                    BinaryDataKind::VideoDataIframe
-                    | BinaryDataKind::VideoDataPframe
-                    | BinaryDataKind::VideoCont => {
-                        data_out.write_all(binary.body())?;
+                trace!("Got {} bytes of video data", binary.buf.len());
+                match binary.kind {
+                    BinaryDataKind::VideoIframe |
+                    BinaryDataKind::VideoPframe => {
+                        data_out.write_all(&binary.buf)?;
                     }
-                    BinaryDataKind::AudioDataAac
-                    | BinaryDataKind::AudioDataAdpcm
-                    | BinaryDataKind::AudioCont => {
-                        ();
+                    BinaryDataKind::AudioAac |
+                    BinaryDataKind::AudioAdpcm => {
+                        // discard
                     }
-                    BinaryDataKind::InfoData | BinaryDataKind::InfoDataCont => {
-                        ();
+                    BinaryDataKind::Info => {
+                        // discard
                     }
                     BinaryDataKind::Unknown => {
-                        ();
+                        // discard
                     }
                 };
             } else {
