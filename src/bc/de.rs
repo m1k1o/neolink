@@ -186,6 +186,8 @@ fn bc_modern_msg<'a, 'b, 'c>(
             // actual video data.  Some media packets must be segmented across multiple 40KB
             // Baichuan packets.  The media packet header contains the total length.
             let detected_kind = media_packet_magic_kind(&data);
+            let lower_limit = media_header_size(detected_kind) as usize;
+
             let detected_len = media_packet_len(detected_kind, &data);
             trace!("Detected {} byte packet, kind {:?}", detected_len, detected_kind);
 
@@ -205,7 +207,6 @@ fn bc_modern_msg<'a, 'b, 'c>(
             };
             trace!("Inferred kind {:?}", inferred_kind);
 
-            let lower_limit = media_header_size(detected_kind) as usize;
             let media_payload_len = std::cmp::min(data.len() - lower_limit, media_state.remaining_kind_bytes as usize);
             let upper_limit = lower_limit + media_payload_len;
             let v = Vec::from(&data[lower_limit..upper_limit]);
@@ -224,7 +225,7 @@ fn bc_modern_msg<'a, 'b, 'c>(
             }
 
             if inferred_kind == BinaryDataKind::Unknown {
-                debug!("Unknown media packet magic value: {:?}", &v[0..4]);
+                debug!("Unknown media packet magic value: {:?}", v.get(0..4));
             }
 
             binary = Some(BinaryData { buf: v, kind: inferred_kind });
@@ -273,36 +274,47 @@ pub fn media_packet_magic_kind(data: &[u8]) -> BinaryDataKind {
     const MAGIC_IFRAME: &[u8] = &[0x30, 0x30, 0x64, 0x63];
     const MAGIC_PFRAME: &[u8] = &[0x30, 0x31, 0x64, 0x63];
 
-    let magic = &data[..4];
+    let magic = data.get(..4);
     trace!("Magic is: {:x?}", &magic);
-    match magic {
-        MAGIC_VIDEO_INFO => {
+    let kind = match magic {
+        Some(MAGIC_VIDEO_INFO) => {
             trace!("Video info magic type");
             BinaryDataKind::Info
         }
-        MAGIC_AAC => {
+        Some(MAGIC_AAC) => {
             trace!("AAC magic type");
             BinaryDataKind::AudioAac
         }
-        MAGIC_ADPCM => {
+        Some(MAGIC_ADPCM) => {
             trace!("ADPCM magic type");
             BinaryDataKind::AudioAdpcm
         }
-        MAGIC_IFRAME => {
+        Some(MAGIC_IFRAME) => {
             trace!("IFrame magic type");
             BinaryDataKind::VideoIframe
         }
-        MAGIC_PFRAME => {
+        Some(MAGIC_PFRAME) => {
             trace!("PFrame magic type");
             BinaryDataKind::VideoPframe
         }
-        _ => {
+        Some(_) => {
             // When large data is chunked it goes here
             // We work out whether or not it is a continued chunked in the deserialization
             trace!("Unknown magic type");
             BinaryDataKind::Unknown
         }
+        None => {
+            trace!("Packet not big enough for magic");
+            return BinaryDataKind::Unknown;
+        }
+    };
+
+    if data.len() < media_header_size(kind) as usize {
+        trace!("Packet not big enough for header");
+        return BinaryDataKind::Unknown;
     }
+
+    kind
 }
 
 fn media_packet_len(kind: BinaryDataKind, data: &[u8]) -> u32 {
